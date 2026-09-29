@@ -1,0 +1,37 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Public ACM certificate for the Vokabeltrainer CloudFront custom domain. Deploy in us-east-1.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Fully qualified custom domain name for the application.
+    AllowedPattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+  ValidationDomain:
+    Type: String
+    Description: Registrable parent domain used by ACM for domain validation.
+  ApplicationName:
+    Type: String
+    Description: Application label used for resource tags.
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          ValidationDomain: !Ref ValidationDomain
+      KeyAlgorithm: RSA_2048
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  CertificateArn:
+    Description: ACM certificate ARN for CloudFront.
+    Value: !Ref Certificate
+  DomainName:
+    Value: !Ref DomainName

@@ -1,0 +1,476 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Vokabeltrainer web application with private static hosting and password-protected AI OCR.
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Short application identifier used for tags and resource labels.
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: "^[A-Za-z0-9-]+$"
+    ConstraintDescription: Use only letters, numbers, and hyphens.
+  Environment:
+    Type: String
+    Description: Deployment environment.
+    Default: production
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: "^[A-Za-z0-9-]+$"
+    ConstraintDescription: Use only letters, numbers, and hyphens.
+  OcrOriginSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+  OcrBasicAuthorization:
+    Type: String
+    NoEcho: true
+  OcrModelId:
+    Type: String
+    Default: eu.amazon.nova-pro-v1:0
+  OcrMonthlyBudgetUsd:
+    Type: Number
+    Default: 6
+    MinValue: 1
+  CustomDomainName:
+    Type: String
+    Default: ""
+    Description: Optional alternate domain name for the CloudFront distribution.
+  CustomCertificateArn:
+    Type: String
+    Default: ""
+    Description: Optional ACM certificate ARN from us-east-1 covering CustomDomainName.
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref CustomDomainName, ""]]
+    - !Not [!Equals [!Ref CustomCertificateArn, ""]]
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: !Sub "OAC for ${ApplicationName} (${Environment})"
+        Name: !Sub "${ApplicationName}-${Environment}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  OcrInputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTemporaryInputs
+            Status: Enabled
+            ExpirationInDays: 1
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  OcrFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadTemporaryImagesAndInvokeBedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${OcrInputBucket.Arn}/*"
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationName}-${Environment}-ocr:*"
+
+  OcrFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ApplicationName}-${Environment}-ocr"
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OcrFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          INPUT_BUCKET: !Ref OcrInputBucket
+          MODEL_ID: !Ref OcrModelId
+          ORIGIN_SECRET: !Ref OcrOriginSecret
+      Code:
+        ZipFile: |
+          const { BedrockRuntimeClient, ConverseCommand } = require("@aws-sdk/client-bedrock-runtime");
+          const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+
+          const bedrock = new BedrockRuntimeClient({});
+          const s3 = new S3Client({});
+          function promptFor(language) {
+            const sourceLanguage = language === "fr" ? "Französisch" : "Englisch";
+            return `Du arbeitest als strikt quellengebundener Transkriptor. Die Bilder zeigen fotografierte ${sourceLanguage}-Deutsch-Vokabelbuchseiten. Lies jede Seite sorgfältig von oben nach unten. Extrahiere jede Zeile der eigentlichen Vokabelliste, bei der links ein ${sourceLanguage === "Französisch" ? "französisches" : "englisches"} Stichwort und daneben seine gedruckte deutsche Bedeutung steht. Behalte grammatische Zusätze und mehrere gedruckte Bedeutungen bei. Entferne Lautschrift vollständig aus dem fremdsprachigen Stichwort; zum Beispiel muss "local [ləʊkəl]" als "local" ausgegeben werden. Ignoriere außerdem Beispielsätze, Seitenverweise, Merkkästen, Illustrationsbeschriftungen sowie Hinweise in anderen Sprachen. Übersetze niemals selbst und ergänze keine Wörter aus deinem Wissen. Wenn Text nicht sicher lesbar ist, übernimm die sichtbare Form und setze uncertain=true sowie eine realistische confidence unter 0.8. Wenn du keine Liste lesen kannst, liefere eine leere words-Liste statt etwas zu erfinden. Antworte ausschließlich mit validem JSON ohne Markdown: {"pages":[{"page":1,"words":[{"foreign":"sichtbarer Text ohne Lautschrift","german":"sichtbarer deutscher Text","confidence":0.0,"uncertain":false}]}]}`;
+          }
+
+          function removePronunciation(value) {
+            return String(value || "").replace(/\s*\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
+          }
+
+          async function readObject(key) {
+            const response = await s3.send(new GetObjectCommand({ Bucket: process.env.INPUT_BUCKET, Key: key }));
+            return Buffer.from(await response.Body.transformToByteArray());
+          }
+
+          async function analyze(images, language = "en") {
+            const content = [{ text: promptFor(language) }];
+            for (const bytes of images) {
+              if (bytes.length > 3.5 * 1024 * 1024) throw new Error("Image exceeds the 3.5 MB application limit.");
+              content.push({ image: { format: "jpeg", source: { bytes } } });
+            }
+            const response = await bedrock.send(new ConverseCommand({
+              modelId: process.env.MODEL_ID,
+              messages: [{ role: "user", content }],
+              inferenceConfig: { maxTokens: images.length === 1 ? 3000 : 9000, temperature: 0 },
+            }));
+            const text = response.output.message.content.find((block) => block.text)?.text || "";
+            const normalized = text.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
+            const result = JSON.parse(normalized);
+            for (const page of result.pages || []) {
+              page.words = (page.words || []).map((word) => ({
+                ...word,
+                foreign: removePronunciation(word.foreign ?? word.french ?? word.english),
+                german: String(word.german ?? word.de ?? "").trim(),
+              })).filter((word) => word.foreign && word.german);
+            }
+            return { result, usage: response.usage };
+          }
+
+          exports.handler = async (event) => {
+            if (event.requestContext?.http) {
+              try {
+                if (event.headers?.["x-origin-secret"] !== process.env.ORIGIN_SECRET) {
+                  return { statusCode: 403, headers: { "content-type": "application/json" }, body: JSON.stringify({ error: "Zugriff verweigert." }) };
+                }
+                const body = JSON.parse(event.body || "{}");
+                if (typeof body.image !== "string" || !body.image) throw new Error("A base64 encoded image is required.");
+                const language = body.language === "fr" ? "fr" : "en";
+                const result = await analyze([Buffer.from(body.image, "base64")], language);
+                return { statusCode: 200, headers: { "content-type": "application/json" }, body: JSON.stringify(result) };
+              } catch (error) {
+                console.error(error);
+                const statusCode = /required|limit/.test(error.message) ? 400 : 502;
+                return { statusCode, headers: { "content-type": "application/json" }, body: JSON.stringify({ error: statusCode === 400 ? error.message : "Die Bilderkennung ist fehlgeschlagen." }) };
+              }
+            }
+            const keys = Array.isArray(event.keys) ? event.keys : [];
+            if (!keys.length || keys.length > 10) throw new Error("Provide between 1 and 10 image keys.");
+            return analyze(await Promise.all(keys.map(readObject)));
+          };
+
+  OcrFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ApplicationName}-${Environment}-ocr"
+      RetentionInDays: 7
+
+  OcrApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ApplicationName}-${Environment}-ocr"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowHeaders: [content-type, authorization]
+        AllowMethods: [POST]
+        MaxAge: 3600
+
+  OcrApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref OcrApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OcrFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 30000
+
+  OcrApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OcrApi
+      RouteKey: POST /api/analyze
+      Target: !Sub "integrations/${OcrApiIntegration}"
+
+  OcrApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref OcrApi
+      StageName: "$default"
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 3
+        ThrottlingRateLimit: 1
+
+  OcrApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OcrFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OcrApi}/*/POST/api/analyze"
+
+  BedrockDenyPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Automatically attached to the OCR Lambda role when the monthly Bedrock budget is exceeded.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+            Resource: "*"
+
+  BudgetActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSBudgetsActionsWithAWSResourceControlAccess
+
+  BudgetActionTopic:
+    Type: AWS::SNS::Topic
+
+  OcrMonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ApplicationName}-${Environment}-ocr-bedrock-monthly"
+        BudgetLimit:
+          Amount: !Ref OcrMonthlyBudgetUsd
+          Unit: USD
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        CostFilters:
+          Service: [Amazon Bedrock]
+
+  OcrBudgetAction:
+    Type: AWS::Budgets::BudgetsAction
+    Properties:
+      ActionThreshold:
+        Type: PERCENTAGE
+        Value: 100
+      ActionType: APPLY_IAM_POLICY
+      ApprovalModel: AUTOMATIC
+      BudgetName: !Ref OcrMonthlyBudget
+      Definition:
+        IamActionDefinition:
+          PolicyArn: !Ref BedrockDenyPolicy
+          Roles: [!Ref OcrFunctionRole]
+      ExecutionRoleArn: !GetAtt BudgetActionRole.Arn
+      NotificationType: ACTUAL
+      Subscribers:
+        - Type: SNS
+          Address: !Ref BudgetActionTopic
+
+  OcrAuthFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${ApplicationName}-${Environment}-ocr-auth"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Password protection for the vocabulary OCR endpoint.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        function handler(event) {
+          var request = event.request;
+          if (request.method === 'OPTIONS') return request;
+          var authorization = request.headers.authorization;
+          if (!authorization || authorization.value !== 'Basic ${OcrBasicAuthorization}') {
+            return {
+              statusCode: 401,
+              statusDescription: 'Unauthorized',
+              headers: {
+                'www-authenticate': { value: 'Basic realm="Vokabeltrainer OCR"' },
+                'content-type': { value: 'application/json' }
+              },
+              body: JSON.stringify({ error: 'Passwort erforderlich.' })
+            };
+          }
+          return request;
+        }
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref CustomDomainName]
+          - !Ref AWS::NoValue
+        Comment: !Sub "${ApplicationName} ${Environment} static web application"
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+          TargetOriginId: private-s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - DomainName: !GetAtt SiteBucket.RegionalDomainName
+            Id: private-s3-origin
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - DomainName: !Sub "${OcrApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+            Id: ocr-api-origin
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+            OriginCustomHeaders:
+              - HeaderName: x-origin-secret
+                HeaderValue: !Ref OcrOriginSecret
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: ocr-api-origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            Compress: true
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt OcrAuthFunction.FunctionARN
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 0
+            ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCachingMinTTL: 0
+            ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CustomCertificateArn
+            MinimumProtocolVersion: TLSv1.2_2021
+            SslSupportMethod: sni-only
+          - CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontDistributionReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+Outputs:
+  BucketName:
+    Description: Name of the private S3 bucket that receives the built site files.
+    Value: !Ref SiteBucket
+  DistributionId:
+    Description: CloudFront distribution ID.
+    Value: !Ref SiteDistribution
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name.
+    Value: !GetAtt SiteDistribution.DomainName
+  CloudFrontUrl:
+    Description: HTTPS URL of the deployed application.
+    Value: !Sub "https://${SiteDistribution.DomainName}"
+  CustomDomainUrl:
+    Condition: HasCustomDomain
+    Description: Custom HTTPS URL of the deployed application.
+    Value: !Sub "https://${CustomDomainName}"
+  OcrApiUrl:
+    Description: Direct OCR API URL; requests still require the CloudFront origin secret.
+    Value: !Sub "https://${OcrApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/analyze"
+  OcrFunctionName:
+    Value: !Ref OcrFunction
+  OcrInputBucketName:
+    Value: !Ref OcrInputBucket
+  OcrBudgetName:
+    Value: !Ref OcrMonthlyBudget
